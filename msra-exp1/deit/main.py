@@ -1,0 +1,621 @@
+# Copyright (c) 2015-present, Facebook, Inc.
+# All rights reserved.
+import argparse
+import datetime
+import numpy as np
+import time
+import torch
+import torch.backends.cudnn as cudnn
+import json
+import os
+import sys
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+
+from timm.data import Mixup
+from timm.models import create_model
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from timm.scheduler import create_scheduler
+from timm.optim import create_optimizer
+from timm.utils import NativeScaler, get_state_dict, ModelEma
+
+from datasets import build_dataset
+from engine import train_one_epoch, evaluate
+from losses import DistillationLoss
+from samplers import RASampler
+from augment import new_data_aug_generator
+
+import models
+import models_v2
+
+import utils
+# begin: yixing
+sys.path.append('./utils_mods')
+sys.path.append('./utils_test')
+from types import MethodType
+from utils_mods import mod_Attention, mod_Attention_forward, mod_DistViT_forward_features, mod_DistViT_forward, mod_block_forward
+from utils_test import union_image
+# end: yixing
+
+def get_args_parser():
+    parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
+    parser.add_argument('--batch-size', default=64, type=int)
+    parser.add_argument('--epochs', default=300, type=int)
+    parser.add_argument('--bce-loss', action='store_true')
+    parser.add_argument('--unscale-lr', action='store_true')
+
+    # Model parameters
+    parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
+                        help='Name of model to train')
+    parser.add_argument('--input-size', default=224, type=int, help='images input size')
+
+    parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
+                        help='Dropout rate (default: 0.)')
+    parser.add_argument('--drop-path', type=float, default=0.1, metavar='PCT',
+                        help='Drop path rate (default: 0.1)')
+
+    parser.add_argument('--model-ema', action='store_true')
+    parser.add_argument('--no-model-ema', action='store_false', dest='model_ema')
+    parser.set_defaults(model_ema=True)
+    parser.add_argument('--model-ema-decay', type=float, default=0.99996, help='')
+    parser.add_argument('--model-ema-force-cpu', action='store_true', default=False, help='')
+
+    # Optimizer parameters
+    parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
+                        help='Optimizer (default: "adamw"')
+    parser.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON',
+                        help='Optimizer Epsilon (default: 1e-8)')
+    parser.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
+                        help='Optimizer Betas (default: None, use opt default)')
+    parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
+                        help='Clip gradient norm (default: None, no clipping)')
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
+                        help='SGD momentum (default: 0.9)')
+    parser.add_argument('--weight-decay', type=float, default=0.05,
+                        help='weight decay (default: 0.05)')
+    # Learning rate schedule parameters
+    parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
+                        help='LR scheduler (default: "cosine"')
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
+                        help='learning rate (default: 5e-4)')
+    parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
+                        help='learning rate noise on/off epoch percentages')
+    parser.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
+                        help='learning rate noise limit percent (default: 0.67)')
+    parser.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
+                        help='learning rate noise std-dev (default: 1.0)')
+    parser.add_argument('--warmup-lr', type=float, default=1e-6, metavar='LR',
+                        help='warmup learning rate (default: 1e-6)')
+    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+
+    parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
+                        help='epoch interval to decay LR')
+    parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
+                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
+                        help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
+    parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
+                        help='patience epochs for Plateau LR scheduler (default: 10')
+    parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
+                        help='LR decay rate (default: 0.1)')
+
+    # Augmentation parameters
+    parser.add_argument('--color-jitter', type=float, default=0.3, metavar='PCT',
+                        help='Color jitter factor (default: 0.3)')
+    parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
+                        help='Use AutoAugment policy. "v0" or "original". " + \
+                             "(default: rand-m9-mstd0.5-inc1)'),
+    parser.add_argument('--smoothing', type=float, default=0.1, help='Label smoothing (default: 0.1)')
+    parser.add_argument('--train-interpolation', type=str, default='bicubic',
+                        help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
+
+    parser.add_argument('--repeated-aug', action='store_true')
+    parser.add_argument('--no-repeated-aug', action='store_false', dest='repeated_aug')
+    parser.set_defaults(repeated_aug=True)
+    
+    parser.add_argument('--train-mode', action='store_true')
+    parser.add_argument('--no-train-mode', action='store_false', dest='train_mode')
+    parser.set_defaults(train_mode=True)
+    
+    parser.add_argument('--ThreeAugment', action='store_true') #3augment
+    
+    parser.add_argument('--src', action='store_true') #simple random crop
+    
+    # * Random Erase params
+    parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
+                        help='Random erase prob (default: 0.25)')
+    parser.add_argument('--remode', type=str, default='pixel',
+                        help='Random erase mode (default: "pixel")')
+    parser.add_argument('--recount', type=int, default=1,
+                        help='Random erase count (default: 1)')
+    parser.add_argument('--resplit', action='store_true', default=False,
+                        help='Do not random erase first (clean) augmentation split')
+
+    # * Mixup params
+    parser.add_argument('--mixup', type=float, default=0.8,
+                        help='mixup alpha, mixup enabled if > 0. (default: 0.8)')
+    parser.add_argument('--cutmix', type=float, default=1.0,
+                        help='cutmix alpha, cutmix enabled if > 0. (default: 1.0)')
+    parser.add_argument('--cutmix-minmax', type=float, nargs='+', default=None,
+                        help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
+    parser.add_argument('--mixup-prob', type=float, default=1.0,
+                        help='Probability of performing mixup or cutmix when either/both is enabled')
+    parser.add_argument('--mixup-switch-prob', type=float, default=0.5,
+                        help='Probability of switching to cutmix when both mixup and cutmix enabled')
+    parser.add_argument('--mixup-mode', type=str, default='batch',
+                        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
+
+    # Distillation parameters
+    parser.add_argument('--teacher-model', default='regnety_160', type=str, metavar='MODEL',
+                        help='Name of teacher model to train (default: "regnety_160"')
+    parser.add_argument('--teacher-path', type=str, default='')
+    parser.add_argument('--distillation-type', default='none', choices=['none', 'soft', 'hard'], type=str, help="")
+    parser.add_argument('--distillation-alpha', default=0.5, type=float, help="")
+    parser.add_argument('--distillation-tau', default=1.0, type=float, help="")
+    
+    # * Cosub params
+    parser.add_argument('--cosub', action='store_true') 
+    
+    # * Finetuning params
+    parser.add_argument('--finetune', default='', help='finetune from checkpoint')
+    parser.add_argument('--attn-only', action='store_true') 
+    
+    # Dataset parameters
+    parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
+                        help='dataset path')
+    parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
+                        type=str, help='Image Net dataset path')
+    parser.add_argument('--inat-category', default='name',
+                        choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
+                        type=str, help='semantic granularity')
+
+    parser.add_argument('--output_dir', default='',
+                        help='path where to save, empty for no saving')
+    parser.add_argument('--device', default='cuda',
+                        help='device to use for training / testing')
+    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
+                        help='start epoch')
+    parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
+    parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
+    parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
+    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--pin-mem', action='store_true',
+                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+    parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
+                        help='')
+    parser.set_defaults(pin_mem=True)
+
+    # distributed training parameters
+    parser.add_argument('--distributed', action='store_true', default=False, help='Enabling distributed training')
+    parser.add_argument('--world_size', default=1, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+
+    # yixing:
+    # double-softmax
+    parser.add_argument('--double-softmax', action='store_true')
+    parser.add_argument('--inside-exp', action='store_true')
+    parser.add_argument('--inside-clip', action='store_true')
+    parser.add_argument('--outside-exp', action='store_true')
+    parser.add_argument('--get-spectrum', action='store_true')
+    parser.add_argument('--get-batch-simi', action='store_true')
+    parser.add_argument('--exp_name', default='', type = str,
+                        help='path where to save, empty for no saving')
+    parser.add_argument('--inside_exp_name', default='', type = str,
+                        help='path where to save, empty for no saving')
+
+    parser.add_argument('--swish-GN', action='store_true')
+    parser.add_argument('--add-rmsnorm', action='store_true')
+    parser.add_argument('--swish-first', action='store_true')
+    return parser
+
+
+def main(args):
+    utils.init_distributed_mode(args)
+
+    struct_time = time.localtime() 
+    time_exp = time.strftime("%Y_%m_%d-%H_%M", struct_time)
+    time_exp = '-' + time_exp 
+    if args.output_dir == '':
+        exp_upper_folder, exp_inside_folder = 'trail', 'trail'
+        if (args.exp_name != ''):
+            exp_upper_folder = args.exp_name
+            exp_inside_folder = args.exp_name
+        if (args.inside_exp_name != ''):
+            exp_inside_folder = args.inside_exp_name
+
+        args.output_dir = f'/home/LeiFeng/Yixing/code/msra/msra-exp1/deit/output/{args.model}/{exp_upper_folder}/{exp_inside_folder}{time_exp}'
+
+    print(args)
+
+    if args.distillation_type != 'none' and args.finetune and not args.eval:
+        raise NotImplementedError("Finetuning with distillation not yet supported")
+
+    device = torch.device(args.device)
+
+    # fix the seed for reproducibility
+    seed = args.seed + utils.get_rank()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    # random.seed(seed)
+
+    cudnn.benchmark = True
+
+    dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
+    dataset_val, _ = build_dataset(is_train=False, args=args)
+
+    if args.distributed:
+        num_tasks = utils.get_world_size()
+        global_rank = utils.get_rank()
+        if args.repeated_aug:
+            sampler_train = RASampler(
+                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            )
+        else:
+            sampler_train = torch.utils.data.DistributedSampler(
+                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            )
+        if args.dist_eval:
+            if len(dataset_val) % num_tasks != 0:
+                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                      'This will slightly alter validation results as extra duplicate entries are added to achieve '
+                      'equal num of samples per-process.')
+            sampler_val = torch.utils.data.DistributedSampler(
+                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+        else:
+            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, sampler=sampler_train,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+    )
+    if args.ThreeAugment:
+        data_loader_train.dataset.transform = new_data_aug_generator(args)
+
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, sampler=sampler_val,
+        batch_size=int(1.5 * args.batch_size),
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False
+    )
+
+    mixup_fn = None
+    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    if mixup_active:
+        mixup_fn = Mixup(
+            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+            label_smoothing=args.smoothing, num_classes=args.nb_classes)
+
+    print(f"Creating model: {args.model}")
+    model = create_model(
+        args.model,
+        pretrained=False,
+        num_classes=args.nb_classes,
+        drop_rate=args.drop,
+        drop_path_rate=args.drop_path,
+        drop_block_rate=None,
+        img_size=args.input_size,
+    )
+    print(model)
+    
+    if args.resume:
+         # model-train/eval-layer-head
+        _train_eval = 'eval' if args.eval else 'train'
+        _dbs = '-dbs' if args.double_softmax else ''
+        _inside_exp = '-inside_exp' if args.inside_exp else ''
+        _outside_exp = '-outside_exp' if args.outside_exp else ''
+        _inside_clip = '-inside_clip' if args.inside_clip else ''
+
+        exp_folder = args.resume[:args.resume.rfind('/')]
+        exp_name = f'{args.model}-{_train_eval}{_dbs}{_inside_exp}{_outside_exp}{_inside_clip}'
+    else:
+        exp_folder = args.output_dir
+        exp_name = args.model
+
+    model_args = {'double_softmax': args.double_softmax, 
+                  'inside_exp': args.inside_exp,
+                  'outside_exp': args.outside_exp,
+                  'inside_clip': args.inside_clip,
+                  'get_spectrum': args.get_spectrum, 
+                  'exp_folder': exp_folder,
+                  'exp_name': exp_name,
+                  'get_batch_simi': args.get_batch_simi,  ###
+                  'swish_GN': args.swish_GN,
+                  'add_rmsnorm': args.add_rmsnorm,
+                  'swish_first': args.swish_first,
+                  }
+
+    for _key, _item in model_args.items():
+        print(f'{_key}: {_item}')
+    if args.double_softmax:
+        print(f'running double_softmax version.')
+    model.forward_features = MethodType(mod_DistViT_forward_features, model)
+    model.forward = MethodType(mod_DistViT_forward, model)
+    for ith_blk, block in enumerate(model.blocks):
+        model.blocks[ith_blk].forward = MethodType(mod_block_forward, model.blocks[ith_blk])
+        model.blocks[ith_blk].attn.forward = MethodType(mod_Attention_forward, model.blocks[ith_blk].attn)
+
+        model.blocks[ith_blk].attn.model_args = model_args
+        model.blocks[ith_blk].attn.ith_blk = ith_blk
+        if args.get_batch_simi:
+            model.blocks[ith_blk].attn.batch_simi = {}
+        if args.get_spectrum:
+            model.blocks[ith_blk].attn.spectrum = {}
+
+
+    # sys.exit(0) # yixin-test 
+       
+    if args.finetune:
+        if args.finetune.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.finetune, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.finetune, map_location='cpu')
+
+        checkpoint_model = checkpoint['model']
+        state_dict = model.state_dict()
+        for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
+            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                print(f"Removing key {k} from pretrained checkpoint")
+                del checkpoint_model[k]
+
+        # interpolate position embedding
+        pos_embed_checkpoint = checkpoint_model['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1]
+        num_patches = model.patch_embed.num_patches
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
+        # height (== width) for the checkpoint position embedding
+        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int(num_patches ** 0.5)
+        # class_token and dist_token are kept unchanged
+        extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+        # only the position tokens are interpolated
+        pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+        pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+        pos_tokens = torch.nn.functional.interpolate(
+            pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+        pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+        new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+        checkpoint_model['pos_embed'] = new_pos_embed
+
+        model.load_state_dict(checkpoint_model, strict=False)
+        
+    if args.attn_only:
+        for name_p,p in model.named_parameters():
+            if '.attn.' in name_p:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+        try:
+            model.head.weight.requires_grad = True
+            model.head.bias.requires_grad = True
+        except:
+            model.fc.weight.requires_grad = True
+            model.fc.bias.requires_grad = True
+        try:
+            model.pos_embed.requires_grad = True
+        except:
+            print('no position encoding')
+        try:
+            for p in model.patch_embed.parameters():
+                p.requires_grad = False
+        except:
+            print('no patch embed')
+            
+    model.to(device)
+
+    model_ema = None
+    if args.model_ema:
+        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
+        model_ema = ModelEma(
+            model,
+            decay=args.model_ema_decay,
+            device='cpu' if args.model_ema_force_cpu else '',
+            resume='')
+
+    model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model_without_ddp = model.module
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print('number of params:', n_parameters)
+    if not args.unscale_lr:
+        linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
+        args.lr = linear_scaled_lr
+    optimizer = create_optimizer(args, model_without_ddp)
+    loss_scaler = NativeScaler()
+
+    lr_scheduler, _ = create_scheduler(args, optimizer)
+
+    criterion = LabelSmoothingCrossEntropy()
+
+    if mixup_active:
+        # smoothing is handled with mixup label transform
+        criterion = SoftTargetCrossEntropy()
+    elif args.smoothing:
+        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
+        
+    if args.bce_loss:
+        criterion = torch.nn.BCEWithLogitsLoss()
+        
+    teacher_model = None
+    if args.distillation_type != 'none':
+        assert args.teacher_path, 'need to specify teacher-path when using distillation'
+        print(f"Creating teacher model: {args.teacher_model}")
+        teacher_model = create_model(
+            args.teacher_model,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            global_pool='avg',
+        )
+        if args.teacher_path.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.teacher_path, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.teacher_path, map_location='cpu')
+        teacher_model.load_state_dict(checkpoint['model'])
+        teacher_model.to(device)
+        teacher_model.eval()
+
+    # wrap the criterion in our custom DistillationLoss, which
+    # just dispatches to the original criterion if args.distillation_type is 'none'
+    criterion = DistillationLoss(
+        criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau
+    )
+
+    output_dir = Path(args.output_dir)
+    if args.resume:
+        if args.resume.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.resume, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.resume, map_location='cpu')
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            args.start_epoch = checkpoint['epoch'] + 1
+            if args.model_ema:
+                utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
+            if 'scaler' in checkpoint:
+                loss_scaler.load_state_dict(checkpoint['scaler'])
+        lr_scheduler.step(args.start_epoch)
+    if args.eval:
+        Path(args.output_dir).mkdir(exist_ok=True, parents=True)
+        test_stats = evaluate(data_loader_val, model, device, args)
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+
+        # start: yixing
+        if args.get_spectrum:
+            caled_batches = list(model_without_ddp.blocks[0].attn.spectrum.keys())
+            caled_spectrum = {idx: [] for idx in caled_batches}
+            for ith_blk, block in enumerate(model_without_ddp.blocks):
+                for _batch, _spectrum in model_without_ddp.blocks[ith_blk].attn.spectrum.items():
+                    caled_spectrum[_batch].append(_spectrum)
+
+            # print(caled_spectrum)
+            # plot spectrum
+            save_folder_spectrum = f'{exp_folder}/spectrum'
+            Path(save_folder_spectrum).mkdir(exist_ok = True, parents = True)
+
+            means_spectrum = []
+            for _batch, _spectrum_per_layer in caled_spectrum.items():
+                means_spectrum.append(np.mean(_spectrum_per_layer))
+                plt.plot(_spectrum_per_layer)
+                plt.title(f'mean: {np.mean(_spectrum_per_layer)}')
+                plt.savefig(f'{save_folder_spectrum}/{exp_name}-batch_{_batch}.png') 
+                plt.clf() 
+            print(f'batch_spectrum: saved {len(means_spectrum)} imgs at {exp_name}-batch_{_batch}')
+
+            print(f'mean of spectrum of {len(means_spectrum)} batches: {np.mean(means_spectrum)}')
+            
+        if args.get_batch_simi:
+            caled_batches = list(model_without_ddp.blocks[0].attn.batch_simi.keys())
+            caled_batch_simi = {idx: [] for idx in caled_batches}
+            for ith_blk, block in enumerate(model_without_ddp.blocks):
+                for _batch, _simi in model_without_ddp.blocks[ith_blk].attn.batch_simi.items():
+                    caled_batch_simi[_batch].append(_simi)
+
+            # plot batch similarity
+            save_folder_batch_simi = f'{exp_folder}/batch_simi'
+            Path(save_folder_batch_simi).mkdir(exist_ok = True, parents = True)
+            for _batch, _simi_per_layer in caled_batch_simi.items():
+                plt.plot(_simi_per_layer)
+                plt.title(f'{exp_name}-batch_{_batch}')
+                plt.savefig(f'{save_folder_batch_simi}/{exp_name}-batch_{_batch}.png') 
+                plt.clf() 
+                print(f'batch_similarity: saved at {exp_name}-batch_{_batch}')
+        # end: yixing
+        
+        return
+
+    print(f"Start training for {args.epochs} epochs")
+    start_time = time.time()
+    max_accuracy = 0.0
+    for epoch in range(args.start_epoch, args.epochs):
+        if args.distributed:
+            data_loader_train.sampler.set_epoch(epoch)
+
+        train_stats = train_one_epoch(
+            model, criterion, data_loader_train,
+            optimizer, device, epoch, loss_scaler,
+            args.clip_grad, model_ema, mixup_fn,
+            set_training_mode=args.train_mode,  # keep in eval mode for deit finetuning / train mode for training and deit III finetuning
+            args = args,
+        )
+        Path(args.output_dir).mkdir(exist_ok=True, parents=True)
+
+        lr_scheduler.step(epoch)
+        if args.output_dir:
+            checkpoint_paths = [output_dir / 'checkpoint.pth']
+            for checkpoint_path in checkpoint_paths:
+                utils.save_on_master({
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'model_ema': get_state_dict(model_ema),
+                    'scaler': loss_scaler.state_dict(),
+                    'args': args,
+                }, checkpoint_path)
+             
+
+        test_stats = evaluate(data_loader_val, model, device, args)
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        
+        if max_accuracy < test_stats["acc1"]:
+            max_accuracy = test_stats["acc1"]
+            if args.output_dir:
+                checkpoint_paths = [output_dir / 'best_checkpoint.pth']
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'model_ema': get_state_dict(model_ema),
+                        'scaler': loss_scaler.state_dict(),
+                        'args': args,
+                    }, checkpoint_path)
+            
+        print(f'Max accuracy: {max_accuracy:.2f}%')
+
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     **{f'test_{k}': v for k, v in test_stats.items()},
+                     'epoch': epoch,
+                     'n_parameters': n_parameters}
+        
+        
+        
+        
+        if args.output_dir and utils.is_main_process():
+            print(f'write log in {args.output_dir}')
+            with (output_dir / "log.txt").open("a") as f:
+                f.write(json.dumps(log_stats) + "\n")
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser('DeiT training and evaluation script', parents=[get_args_parser()])
+    args = parser.parse_args()
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    main(args)
