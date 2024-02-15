@@ -203,14 +203,19 @@ def get_args_parser():
     parser.add_argument('--outside-exp', action='store_true')
     parser.add_argument('--get-spectrum', action='store_true')
     parser.add_argument('--get-batch-simi', action='store_true')
+    parser.add_argument('--get-spectrum-num', default=None, type=int,)
+    parser.add_argument('--get-batch-simi-num', default=None, type=int,)
+    
     parser.add_argument('--exp_name', default='', type = str,
                         help='path where to save, empty for no saving')
     parser.add_argument('--inside_exp_name', default='', type = str,
                         help='path where to save, empty for no saving')
 
-    parser.add_argument('--swish-GN', action='store_true')
+    parser.add_argument('--swish', action='store_true')
     parser.add_argument('--add-rmsnorm', action='store_true')
     parser.add_argument('--swish-first', action='store_true')
+    
+    parser.add_argument('--HW-GN', action='store_true')
     return parser
 
 
@@ -332,9 +337,10 @@ def main(args):
                   'exp_folder': exp_folder,
                   'exp_name': exp_name,
                   'get_batch_simi': args.get_batch_simi,  ###
-                  'swish_GN': args.swish_GN,
+                  'swish': args.swish,
                   'add_rmsnorm': args.add_rmsnorm,
                   'swish_first': args.swish_first,
+                  'HW_GN': args.HW_GN,
                   }
 
     for _key, _item in model_args.items():
@@ -496,7 +502,6 @@ def main(args):
                 loss_scaler.load_state_dict(checkpoint['scaler'])
         lr_scheduler.step(args.start_epoch)
     if args.eval:
-        Path(args.output_dir).mkdir(exist_ok=True, parents=True)
         test_stats = evaluate(data_loader_val, model, device, args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
@@ -539,7 +544,8 @@ def main(args):
                 plt.title(f'{exp_name}-batch_{_batch}')
                 plt.savefig(f'{save_folder_batch_simi}/{exp_name}-batch_{_batch}.png') 
                 plt.clf() 
-                print(f'batch_similarity: saved at {exp_name}-batch_{_batch}')
+            if len(caled_batch_simi) > 0:
+                print(f'batch_similarity: saved at {save_folder_batch_simi}')
         # end: yixing
         
         return

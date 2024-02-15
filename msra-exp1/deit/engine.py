@@ -199,7 +199,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
 @torch.no_grad()
 def evaluate(data_loader, model, device, args):
-    criterion = torch.nn.CrossEntropyLoss()
+    if args.cosub:
+        criterion = torch.nn.BCEWithLogitsLoss()
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -209,15 +212,19 @@ def evaluate(data_loader, model, device, args):
 
     for ith_images, (images, target) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # start: yixing
-        if args.get_spectrum:
-            # pass
-            get_batches = range(1)
-            if ith_images not in get_batches:
-                break
-        if args.get_batch_simi:
-            get_batches = range(100)
-            if ith_images not in get_batches:
-                break
+        get_res = args.get_spectrum or args.get_batch_simi
+        get_res_args = {'get_spectrum': args.get_spectrum, 'get_batch_simi': args.get_batch_simi}
+        if args.get_spectrum and args.get_spectrum_num is not None:
+            if (ith_images not in range(args.get_spectrum_num)):
+                get_res_args['get_spectrum'] = False 
+        if args.get_batch_simi and args.get_batch_simi_num is not None:
+            if (ith_images not in (range( args.get_batch_simi_num))):
+                get_res_args['get_batch_simi'] = False 
+        if get_res and (not get_res_args['get_spectrum']) and (not get_res_args['get_batch_simi']):
+            print(f'get result mode, results got but test set not finished yet.')
+            # break
+            pass
+            
         # end: yixing
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
@@ -225,7 +232,7 @@ def evaluate(data_loader, model, device, args):
         # compute output
         # with torch.cuda.amp.autocast():
         if True:
-            output = model(images, ith_images = ith_images)
+            output = model(images, ith_images = ith_images, get_res_args = get_res_args)
             loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))

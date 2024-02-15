@@ -3,10 +3,10 @@ import torch.nn as nn
 from functools import partial
 
 
-def mod_DistViT_forward_features(self, x, observe = False, ith_images = None):
+def mod_DistViT_forward_features(self, x, observe = False, ith_images = None, get_res_args = None):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     # with slight modifications to add the dist_token
-    ith_image_dict = {'ith_images': ith_images} if ith_images is not None else {}
+    ith_image_dict = {'ith_images': ith_images, 'get_res_args': get_res_args} if ith_images is not None else {}
 
     if observe:
         print(f'0 torch.isnan(x).any():{torch.isnan(x).any()}') 
@@ -41,10 +41,10 @@ def mod_DistViT_forward_features(self, x, observe = False, ith_images = None):
         print(f'6 torch.isnan(x).any():{torch.isnan(x).any()}') 
     return x[:, 0], x[:, 1]
 
-def mod_DistViT_forward(self, x, observe = False, ith_images = None):
+def mod_DistViT_forward(self, x, observe = False, ith_images = None, get_res_args = None):
     if observe:
         print(f'0 before: torch.isnan(x).any():{torch.isnan(x).any()}') 
-    ith_image_dict = {'ith_images': ith_images} if ith_images is not None else {}
+    ith_image_dict = {'ith_images': ith_images, 'get_res_args': get_res_args} if ith_images is not None else {}
     x, x_dist = self.forward_features(x, observe, **ith_image_dict)
     if observe:
         print(f'final: torch.isnan(x).any():{torch.isnan(x).any()}') 

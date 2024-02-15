@@ -12,6 +12,7 @@ class RMSNorm(nn.Module):
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.ones(dim))
         else:
+            # goes to here.
             self.register_parameter('weight', None)
 
     def _norm(self, x):
@@ -20,6 +21,7 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         if self.weight is not None:
+            # not here.
             output = output * self.weight
         return output
     

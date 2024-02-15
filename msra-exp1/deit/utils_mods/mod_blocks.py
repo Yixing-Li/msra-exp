@@ -21,8 +21,8 @@ class Block(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
-def mod_block_forward(self, x, observe = False, ith_images = None):
-    ith_image_dict = {'ith_images': ith_images} if ith_images is not None else {}
+def mod_block_forward(self, x, observe = False, ith_images = None, get_res_args = None):
+    ith_image_dict = {'ith_images': ith_images, 'get_res_args': get_res_args} if ith_images is not None else {}
 
     x = x + self.drop_path(self.attn(self.norm1(x), observe, **ith_image_dict))
     x = x + self.drop_path(self.mlp(self.norm2(x)))

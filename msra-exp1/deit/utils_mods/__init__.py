@@ -2,3 +2,4 @@ from mod_attention import mod_Attention, mod_Attention_forward
 from mod_models import mod_DistViT_forward_features, mod_DistViT_forward
 from mod_blocks import mod_block_forward
 from rms_norm import RMSNorm
+from headwise_GroupNorm import HeadWiseGroupNorm
