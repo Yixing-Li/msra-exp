@@ -216,6 +216,10 @@ def get_args_parser():
     parser.add_argument('--swish-first', action='store_true')
     
     parser.add_argument('--HW-GN', action='store_true')
+
+    parser.add_argument('--get-histo', action='store_true')
+    parser.add_argument('--use-mix', action='store_true')
+
     return parser
 
 
@@ -233,7 +237,7 @@ def main(args):
         if (args.inside_exp_name != ''):
             exp_inside_folder = args.inside_exp_name
 
-        args.output_dir = f'/home/LeiFeng/Yixing/code/msra/msra-exp1/deit/output/{args.model}/{exp_upper_folder}/{exp_inside_folder}{time_exp}'
+        args.output_dir = f'./output/{args.model}/{exp_upper_folder}/{exp_inside_folder}{time_exp}'
 
     print(args)
 

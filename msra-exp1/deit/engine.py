@@ -14,6 +14,7 @@ from timm.utils import accuracy, ModelEma
 
 from losses import DistillationLoss
 import utils
+from tensorboardX import SummaryWriter
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
@@ -54,8 +55,19 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         if args.bce_loss:
             targets = targets.gt(0.0).type(targets.dtype)
          
-        # with torch.cuda.amp.autocast(): # Yixing: this would cause loss -> nan
-        if True:
+        if args.use_mix:
+            with torch.cuda.amp.autocast(): # Yixing: this would cause loss -> nan
+                outputs = model(samples)
+                if not args.cosub:
+                    # yixing: goes here.
+                    loss = criterion(samples, outputs, targets)
+                else:
+                    outputs = torch.split(outputs, outputs.shape[0]//2, dim=0)
+                    loss = 0.25 * criterion(outputs[0], targets) 
+                    loss = loss + 0.25 * criterion(outputs[1], targets) 
+                    loss = loss + 0.25 * criterion(outputs[0], outputs[1].detach().sigmoid())
+                    loss = loss + 0.25 * criterion(outputs[1], outputs[0].detach().sigmoid()) 
+        else: #if True:
             outputs = model(samples)
             if not args.cosub:
                 # yixing: goes here.
@@ -90,6 +102,31 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
         loss_scaler(loss, optimizer, clip_grad=max_norm,
                     parameters=model.parameters(), create_graph=is_second_order)
+
+        if args.get_histo and (ith_sample % 200 == 0):
+            writer = None
+            if utils.is_main_process():
+                writer = SummaryWriter(f"{args.output_dir}/tmp/tb_grad_histo/v2_4k")  # for tensorboardX
+
+                # gradient histogram in tensorboard
+                is_infinite, is_finite = False, None
+                for name, par in model.named_parameters():
+                    is_infinite = is_infinite or torch.isnan(par).any()
+                is_finite = not is_infinite
+
+                if writer is not None and is_finite: #torch.isfinite(grad_norm).all():
+                    for n, p in model.named_parameters():
+                        if (p.requires_grad) and ("bias" not in n):
+                            # self.writer.add_histogram("grad/{}".format(name), p.grad.float() * (float(args.update_freq[0]) / _acc_norm / _cur_scale), global_step)
+                            if n.startswith('decoder.layers.'):
+                                layer_idx, module_name = n[len(
+                                    'decoder.layers.'):].split('.', 1)
+                                writer.add_histogram(
+                                    "grad_layer/{}".format(module_name), p.grad.float() / float(optimizer.scaler.loss_scale), int(layer_idx))
+                    writer.flush()
+                    print('gradient histogram in tensorboard')
+                else:
+                    print('isfinite', is_finite) # torch.isfinite(grad_norm).all())
 
         # for name, param in model.named_parameters():
         #     print(f'**{ith_sample} grad**:{name}, {param.grad}', end = '\n\n')
@@ -230,8 +267,11 @@ def evaluate(data_loader, model, device, args):
         target = target.to(device, non_blocking=True)
 
         # compute output
-        # with torch.cuda.amp.autocast():
-        if True:
+        if args.use_mix:
+            with torch.cuda.amp.autocast():
+                output = model(images, ith_images = ith_images, get_res_args = get_res_args)
+                loss = criterion(output, target)
+        else: #if True:
             output = model(images, ith_images = ith_images, get_res_args = get_res_args)
             loss = criterion(output, target)
 
