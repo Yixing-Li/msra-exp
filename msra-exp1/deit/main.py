@@ -238,6 +238,7 @@ def main(args):
             exp_inside_folder = args.inside_exp_name
 
         args.output_dir = f'./output/{args.model}/{exp_upper_folder}/{exp_inside_folder}{time_exp}'
+        args.tb_folder = f'{exp_inside_folder}{time_exp}'
 
     print(args)
 

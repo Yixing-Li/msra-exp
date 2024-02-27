@@ -16,12 +16,13 @@ from losses import DistillationLoss
 import utils
 from tensorboardX import SummaryWriter
 
+total_histo = 0
 
 def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True, args = None):
+                    set_training_mode=True, args = None, ):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -32,6 +33,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         criterion = torch.nn.BCEWithLogitsLoss()
         
     last_loss = None
+    
     for ith_sample, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # if ith_sample <= 2000:
         #     metric_logger.update(loss=0)
@@ -103,10 +105,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         loss_scaler(loss, optimizer, clip_grad=max_norm,
                     parameters=model.parameters(), create_graph=is_second_order)
 
-        if args.get_histo and (ith_sample % 200 == 0):
+        global total_histo
+        if args.get_histo and (ith_sample % 1000 == 0):
             writer = None
             if utils.is_main_process():
-                writer = SummaryWriter(f"{args.output_dir}/tmp/tb_grad_histo/v2_4k")  # for tensorboardX
+                writer = SummaryWriter(f"{args.output_dir}/logs-{args.tb_folder}/epoch_{epoch}-sample_{ith_sample}-{args.tb_folder}")  # for tensorboardX
 
                 # gradient histogram in tensorboard
                 is_infinite, is_finite = False, None
@@ -116,15 +119,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
                 if writer is not None and is_finite: #torch.isfinite(grad_norm).all():
                     for n, p in model.named_parameters():
+                        # print(n)
                         if (p.requires_grad) and ("bias" not in n):
                             # self.writer.add_histogram("grad/{}".format(name), p.grad.float() * (float(args.update_freq[0]) / _acc_norm / _cur_scale), global_step)
-                            if n.startswith('decoder.layers.'):
-                                layer_idx, module_name = n[len(
-                                    'decoder.layers.'):].split('.', 1)
+                            if n.startswith('blocks.'):
+                                layer_idx, module_name = n[len('blocks.'):].split('.', 1)
                                 writer.add_histogram(
-                                    "grad_layer/{}".format(module_name), p.grad.float() / float(optimizer.scaler.loss_scale), int(layer_idx))
+                                    "grad_layer/{}".format(module_name), p.grad.float(), int(layer_idx))
+                                # print(f''got grad_layer of layer {layer_idx})
                     writer.flush()
-                    print('gradient histogram in tensorboard')
+                    total_histo += 1
+                    print(f'{ith_sample}-th sample: gradient histogram in tensorboard; {total_histo} in total.')
                 else:
                     print('isfinite', is_finite) # torch.isfinite(grad_norm).all())
 
