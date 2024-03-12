@@ -12,8 +12,10 @@ import deepspeed
 
 import random
 import json
+import yaml
 from tqdm import tqdm
 import math
+import copy
 
 from transformers import (
     AutoModelForCausalLM,
@@ -42,6 +44,7 @@ from rouge_metric import compute_metrics
 from peft import PeftModel
 
 torch.set_num_threads(4)
+from tensorboardX import SummaryWriter
 
 
 def get_teacher_model(args, device):
@@ -67,7 +70,7 @@ def get_teacher_model(args, device):
             args.teacher_model_path, 
             config=config, 
             device_map={"": device}, 
-            torch_dtype=date_type
+            torch_dtype=data_type
         )
 
         if args.peft is not None and args.teacher_peft_path is not None:
@@ -293,6 +296,8 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
     step, global_step = 1, 1
     total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
+
+    writer = SummaryWriter(f'{args.save}/tb_logs')
     
     evaluate(args, tokenizer, model, dataset["dev"], "dev", 0, device)
     for epoch in range(args.epochs):
@@ -325,6 +330,12 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             else:
                 loss = lm_loss
                 
+            if step % args.gradient_accumulation_steps == 0:
+                # tensorboard 
+                writer.add_scalar("loss", loss.detach(), global_step)
+                if teacher_model is not None:
+                    writer.add_scalar("distil_loss", distil_loss.detach(), global_step)
+            
             model.backward(loss)
             model.step()
             
@@ -407,7 +418,8 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             
             if global_step > args.total_iters:
                 break
-            
+
+    writer.close()        
     return model
 
 
@@ -532,8 +544,11 @@ def main():
     
     if dist.get_rank() == 0:
         print_args(args)
-        with open(os.path.join(args.save, "args.json"), "w") as f:
-            json.dump(vars(args), f)
+        # with open(os.path.join(args.save, "args.json"), "w") as f:
+        #     json.dump(vars(args), f)
+        # args_dict = vars(copy.copy(args))
+        # with open(os.path.join(args.save, "args.json"), "w") as yaml_file:
+        #     yaml.dump(args_dict, yaml_file, default_flow_style=False)
     
     device = torch.cuda.current_device()
     cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())

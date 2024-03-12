@@ -47,6 +47,7 @@ def add_model_args(parser: argparse.ArgumentParser):
     group.add_argument("--reference-free", action="store_true")
     group.add_argument("--dpo-beta", type=float, default=0.1)
     group.add_argument("--label-smoothing", type=float, default=0.)
+    group.add_argument("--kd-ratio", type=float, default=None) # gpt2 seqkd: 0.5
     # place of the view(-1) 
     ###
     return parser
@@ -141,7 +142,6 @@ def add_hp_args(parser: argparse.ArgumentParser):
                        help='weight-decay')
     group.add_argument('--loss-scale', type=float, default=65536,
                        help='loss scale')
-    group.add_argument("--kd-ratio", type=float, default=None)
 
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '

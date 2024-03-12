@@ -58,7 +58,6 @@ OPTS+=" --lr-decay-style cosine"
 OPTS+=" --weight-decay 1e-2"
 OPTS+=" --clip-grad 1.0"
 OPTS+=" --epochs 20"
-OPTS+=" --kd-ratio 0.5"
 # length
 OPTS+=" --max-length ${MAX_LENGTH}"
 OPTS+=" --max-prompt-length 256"
@@ -87,6 +86,7 @@ OPTS+=" --temperature 1.0"
 ### seqKD-DPO
 OPTS+=" --seqKD-DPO"
 OPTS+=" --bf16"
+OPTS+=" --kd-ratio 0.5"
 
 
 
