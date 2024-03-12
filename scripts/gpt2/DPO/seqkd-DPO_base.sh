@@ -86,6 +86,7 @@ OPTS+=" --temperature 1.0"
 
 ### seqKD-DPO
 OPTS+=" --seqKD-DPO"
+OPTS+=" --bf16"
 
 
 

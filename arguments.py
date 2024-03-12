@@ -36,7 +36,19 @@ def add_model_args(parser: argparse.ArgumentParser):
     group.add_argument("--model-parallel-size", type=int, default=None)
     group.add_argument("--no-value", action="store_true")
     group.add_argument("--dropout-path-rate", type=float, default=None)
+
     group.add_argument("--fp32", action="store_true")
+    group.add_argument("--fp16", action="store_true")
+    group.add_argument("--bf16", action="store_true")
+    group.add_argument("--dtype", default=None)
+    group.add_argument("--seqKD-DPO", action="store_true")
+
+    ### TO finetune
+    group.add_argument("--reference-free", action="store_true")
+    group.add_argument("--dpo-beta", type=float, default=0.1)
+    group.add_argument("--label-smoothing", type=float, default=0.)
+    # place of the view(-1) 
+    ###
     return parser
 
 

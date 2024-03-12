@@ -133,6 +133,14 @@ def initialize(args):
     if args.save != None:
         os.makedirs(args.save, exist_ok=True)
 
+    if args.fp32:
+        args.dtype = torch.float32
+    elif args.bf16:
+        args.dtype = torch.bfloat16
+    else:
+        args.dtype = torch.float16
+    return args
+
 
 # Load and save model
 def get_model(args, device):
@@ -145,8 +153,12 @@ def get_model(args, device):
             if args.model_type=="qwen":
                 model = parallel_model_map[args.model_type](config).to(torch.bfloat16)
             else:
-                model = parallel_model_map[args.model_type](config).half()
-        load_parallel(model, args.model_path)
+                # yixing
+                if args.dtype is not None:
+                    model = parallel_model_map[args.model_type](config).to(args.dtype)
+                else:
+                    model = parallel_model_map[args.model_type](config).half()
+        load_parallel(model, args.model_path, args)
 
         if mpu.get_data_parallel_rank() == 0:
             print(' > number of parameters on model parallel rank {}: {}'.format(
@@ -157,7 +169,10 @@ def get_model(args, device):
         if args.model_type=="qwen":
             dtype = torch.float32 if args.fp32 else torch.float16
         else:
-            dtype = torch.float32 if args.fp32 else torch.bfloat16
+            if args.fp32 and args.bf16:
+                raise(f'data type error: both fp16 and bf16 !')
+            # dtype = torch.float32 if args.fp32 else torch.bfloat16
+            dtype = args.dtype if args.dtype is not None else torch.float32
         model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=dtype)
 
         if args.peft is not None:
@@ -225,12 +240,14 @@ def get_tokenizer(args):
     return tokenizer
 
 
-def load_parallel(model, load_dir):
+def load_parallel(model, load_dir, args):
     mp_rank = mpu.get_model_parallel_rank()
     assert mpu.get_model_parallel_world_size() != 1
     checkpoint_name = os.path.join(load_dir, f"mp{mpu.get_model_parallel_world_size()}", f"pytorch_model_{mp_rank}.bin")
     assert os.path.exists(checkpoint_name), f"{checkpoint_name} does not exist."
-    model = load_checkpoint_and_dispatch(model=model, checkpoint=checkpoint_name, device_map={"": torch.cuda.current_device()}, dtype=torch.float16)
+    
+    dtype = args.dtype if args.dtype is not None else torch.float32
+    model = load_checkpoint_and_dispatch(model=model, checkpoint=checkpoint_name, device_map={"": torch.cuda.current_device()}, dtype=dtype) #torch.float16)
     dist.barrier()
     print(f"Rank {get_rank()}: {checkpoint_name} loaded.")
 

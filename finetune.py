@@ -52,16 +52,22 @@ def get_teacher_model(args, device):
             if args.model_type=="qwen":
                 model = parallel_model_map[args.model_type](config).to(torch.bfloat16)
             else:
-                model = parallel_model_map[args.model_type](config).half()
+                # yixing
+                if args.dtype is not None:
+                    model = parallel_model_map[args.model_type](config).to(args.dtype)
+                else:
+                    model = parallel_model_map[args.model_type](config).half()
         load_parallel(model, args.teacher_model_path)
         model = model.to(device)
     else:
         config.is_model_parallel = False
+        # date_type = torch.bfloat16 if (args.bf16 or args.model_type=="qwen") else torch.float16
+        data_type = args.dtype if args.dtype is not None else torch.float32
         model = AutoModelForCausalLM.from_pretrained(
             args.teacher_model_path, 
             config=config, 
             device_map={"": device}, 
-            torch_dtype=torch.float16 if args.model_type!="qwen" else torch.bfloat16
+            torch_dtype=date_type
         )
 
         if args.peft is not None and args.teacher_peft_path is not None:
@@ -168,20 +174,59 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
         teacher_model.eval()
         teacher_outputs = teacher_model(**model_batch, use_cache=False)
         teacher_logits = teacher_outputs.logits
-    if args.model_parallel:
-        distil_losses = mpu.parallel_soft_cross_entropy_loss(logits.float(), teacher_logits.float())
-        distil_losses = distil_losses.view(-1)
-        loss_mask = no_model_batch["loss_mask"].view(-1)
-        distil_loss = (distil_losses * loss_mask).sum(-1) / loss_mask.sum(-1)
+
+    if not args.seqKD_DPO:
+        if args.model_parallel:
+            distil_losses = mpu.parallel_soft_cross_entropy_loss(logits.float(), teacher_logits.float())
+            distil_losses = distil_losses.view(-1)
+            loss_mask = no_model_batch["loss_mask"].view(-1)
+            distil_loss = (distil_losses * loss_mask).sum(-1) / loss_mask.sum(-1)
+        else:
+            teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
+            inf_mask = torch.isinf(logits)
+            logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
+            prod_probs = torch.masked_fill(teacher_probs * logprobs, inf_mask, 0)
+            x = torch.sum(prod_probs, dim=-1).view(-1)
+            mask = (no_model_batch["label"] != -100).int()
+            distil_loss = -torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0)
     else:
-        teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
+        # if args.model_parallel:
+        #     pass
+        log_teacher_probs = F.log_softmax(teacher_logits, dim=-1, dtype=torch.bfloat32)
         inf_mask = torch.isinf(logits)
-        logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
-        prod_probs = torch.masked_fill(teacher_probs * logprobs, inf_mask, 0)
-        x = torch.sum(prod_probs, dim=-1).view(-1)
-        mask = (no_model_batch["label"] != -100).int()
-        distil_loss = -torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0)
-    
+        log_student_probs =F.log_softmax(logits, dim=-1, dtype=torch.bfloat32)
+        log_student_probs = torch.masked_fill(log_student_probs, inf_mask, 0)
+
+        y_t = torch.argmax( log_teacher_probs, dim= -1, keepdim = False )# [batch size, max lenth]
+        y_s = torch.argmax( log_student_probs, dim= -1, keepdim = False )
+
+        teacher_chosen_logps = torch.gather(log_teacher_probs, 2, y_t.unsqueeze(-1)).squeeze(-1) # [bs, maxlenth, 1] 
+        teacher_reject_logps = torch.gather(log_teacher_probs, 2, y_s.unsqueeze(-1)).squeeze(-1)
+        student_chosen_logps = torch.gather(log_student_probs, 2,y_t.unsqueeze(-1)).squeeze(-1)
+        student_reject_logps = torch.gather(log_student_probs, 2,y_s.unsqueeze(-1)).squeeze(-1)
+
+        print(teacher_chosen_logps.shape)
+        sys.exit(0)
+
+        stu_logratios = student_chosen_logps - student_rejected_logps
+        tea_logratios = teacher_chosen_logps - teacher_rejected_logps
+
+        if args.reference_free:
+            tea_logratios = 0
+
+        relative_logits = stu_logratios - tea_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
+
+        if ipo:
+            distil_loss = (relative_logits - 1/(2 * args.dpo_beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
+        else:
+            # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
+            distil_loss = -F.logsigmoid(args.dpo_beta * relative_logits) * (1 - args.label_smoothing) - F.logsigmoid(-args.dpo_beta * relative_logits) * args.label_smoothing
+
+        chosen_rewards = args.dpo_beta * (student_chosen_logps - reference_chosen_logps).detach()
+        rejected_rewards = args.dpo_beta * (student_rejected_logps - reference_rejected_logps).detach()
+
+        # return distil_loss, chosen_rewards, rejected_rewards
+
     return distil_loss
 
 
@@ -483,6 +528,7 @@ def main():
     
     args = get_args()
     initialize(args)
+
     
     if dist.get_rank() == 0:
         print_args(args)
