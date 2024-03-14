@@ -1,5 +1,8 @@
 import time
 import os
+import sys
+   
+import numpy as np  
 
 import torch
 import torch.nn as nn
@@ -16,6 +19,7 @@ import yaml
 from tqdm import tqdm
 import math
 import copy
+import time
 
 from transformers import (
     AutoModelForCausalLM,
@@ -45,7 +49,7 @@ from peft import PeftModel
 
 torch.set_num_threads(4)
 from tensorboardX import SummaryWriter
-
+start_time = None
 
 def get_teacher_model(args, device):
     config = AutoConfig.from_pretrained(args.teacher_model_path)
@@ -188,16 +192,16 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
             teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
             inf_mask = torch.isinf(logits)
             logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
-            prod_probs = torch.masked_fill(teacher_probs * logprobs, inf_mask, 0)
-            x = torch.sum(prod_probs, dim=-1).view(-1)
-            mask = (no_model_batch["label"] != -100).int()
-            distil_loss = -torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0)
+            prod_probs = torch.masked_fill(teacher_probs * logprobs, inf_mask, 0) # above: [bs, max_lenth, dim]
+            x = torch.sum(prod_probs, dim=-1).view(-1) # [bs * max_lenth]
+            mask = (no_model_batch["label"] != -100).int() # [bs, max_lenth], view(-1)->[bs*max_lenth]
+            distil_loss = -torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0) # num
     else:
         # if args.model_parallel:
         #     pass
-        log_teacher_probs = F.log_softmax(teacher_logits, dim=-1, dtype=torch.bfloat32)
+        log_teacher_probs = F.log_softmax(teacher_logits, dim=-1, dtype=torch.bfloat16)
         inf_mask = torch.isinf(logits)
-        log_student_probs =F.log_softmax(logits, dim=-1, dtype=torch.bfloat32)
+        log_student_probs =F.log_softmax(logits, dim=-1, dtype=torch.bfloat16)
         log_student_probs = torch.masked_fill(log_student_probs, inf_mask, 0)
 
         y_t = torch.argmax( log_teacher_probs, dim= -1, keepdim = False )# [batch size, max lenth]
@@ -208,29 +212,88 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
         student_chosen_logps = torch.gather(log_student_probs, 2,y_t.unsqueeze(-1)).squeeze(-1)
         student_reject_logps = torch.gather(log_student_probs, 2,y_s.unsqueeze(-1)).squeeze(-1)
 
-        print(teacher_chosen_logps.shape)
-        sys.exit(0)
+        # teacher_chosen_logps [BATCH_SIZE, token_lenth] 
+        # mask = (no_model_batch["label"] != -100).int() # [bs, maxlenth]
 
-        stu_logratios = student_chosen_logps - student_rejected_logps
-        tea_logratios = teacher_chosen_logps - teacher_rejected_logps
+        stu_logratios = student_chosen_logps - student_reject_logps # [bs, maxlenth]； in DPO, should shaped [bs]
+        tea_logratios = teacher_chosen_logps - teacher_reject_logps
+        # stu_logratios = torch.sum(torch.mul(stu_logratios, mask), dim=-1) / torch.sum(mask, dim=-1)
+        # tea_logratios = torch.sum(torch.mul(tea_logratios, mask), dim=-1) / torch.sum(mask, dim=-1)
 
         if args.reference_free:
             tea_logratios = 0
 
         relative_logits = stu_logratios - tea_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
 
-        if ipo:
+        if args.ipo:
             distil_loss = (relative_logits - 1/(2 * args.dpo_beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
+        elif args.DPOP:
+            dpop_logartios = teacher_chosen_logps - student_chosen_logps
+            # dpop_logartios = torch.sum(torch.mul(dpop_logartios, mask), dim=-1) / torch.sum(mask, dim=-1)
+
+            distil_loss = -( F.logsigmoid(args.dpo_beta * relative_logits) - args.DPOP_lambda * torch.max(torch.zeros_like(dpop_logartios).to(dpop_logartios.device), dpop_logartios))
+        else:
+            # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
+            distil_loss = -F.logsigmoid(args.dpo_beta * relative_logits) * (1 - args.label_smoothing) - F.logsigmoid(-args.dpo_beta * relative_logits) * args.label_smoothing # [bs, max-lenth]
+
+        distil_loss = torch.sum(distil_loss) # num
+
+        chosen_rewards = args.dpo_beta * (student_chosen_logps - teacher_chosen_logps).detach()
+        rejected_rewards = args.dpo_beta * (student_reject_logps - teacher_reject_logps).detach()
+        # return distil_loss, chosen_rewards, rejected_rewards
+
+    return distil_loss
+
+
+
+'''
+        # if args.model_parallel:
+        #     pass
+        log_teacher_probs = F.log_softmax(teacher_logits, dim=-1, dtype=torch.bfloat16)
+        inf_mask = torch.isinf(logits)
+        log_student_probs =F.log_softmax(logits, dim=-1, dtype=torch.bfloat16)
+        log_student_probs = torch.masked_fill(log_student_probs, inf_mask, 0)
+
+        y_t = torch.argmax( log_teacher_probs, dim= -1, keepdim = False )# [batch size, max lenth]
+        y_s = torch.argmax( log_student_probs, dim= -1, keepdim = False )
+
+        teacher_chosen_logps = torch.gather(log_teacher_probs, 2, y_t.unsqueeze(-1)).squeeze(-1) # [bs, maxlenth, 1] 
+        teacher_reject_logps = torch.gather(log_teacher_probs, 2, y_s.unsqueeze(-1)).squeeze(-1)
+        student_chosen_logps = torch.gather(log_student_probs, 2,y_t.unsqueeze(-1)).squeeze(-1)
+        student_reject_logps = torch.gather(log_student_probs, 2,y_s.unsqueeze(-1)).squeeze(-1)
+
+        # print(teacher_chosen_logps.shape) # [BATCH_SIZE, token_lenth] 
+        mask = (no_model_batch["label"] != -100).int() # [bs, maxlenth]
+
+        stu_logratios = student_chosen_logps - student_reject_logps # [bs, maxlenth]； in DPO, should shaped [bs]
+        tea_logratios = teacher_chosen_logps - teacher_reject_logps
+        stu_logratios = torch.sum(torch.mul(stu_logratios, mask), dim=-1) / torch.sum(mask, dim=-1)
+        tea_logratios = torch.sum(torch.mul(tea_logratios, mask), dim=-1) / torch.sum(mask, dim=-1)
+
+        if args.reference_free:
+            tea_logratios = 0
+
+        relative_logits = stu_logratios - tea_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
+
+        if args.ipo:
+            distil_loss = (relative_logits - 1/(2 * args.dpo_beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
+        elif args.DPOP:
+            dpop_logartios = teacher_chosen_logps - student_chosen_logps
+            dpop_logartios = torch.sum(torch.mul(dpop_logartios, mask), dim=-1) / torch.sum(mask, dim=-1)
+
+            distil_loss = -( F.logsigmoid(args.dpo_beta * relative_logits) - args.DPOP_lambda * torch.max(torch.zeros_like(dpop_logartios).to(dpop_logartios.device), dpop_logartios))
         else:
             # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
             distil_loss = -F.logsigmoid(args.dpo_beta * relative_logits) * (1 - args.label_smoothing) - F.logsigmoid(-args.dpo_beta * relative_logits) * args.label_smoothing
 
-        chosen_rewards = args.dpo_beta * (student_chosen_logps - reference_chosen_logps).detach()
-        rejected_rewards = args.dpo_beta * (student_rejected_logps - reference_rejected_logps).detach()
+        distil_loss = torch.sum(distil_loss)
 
+        chosen_rewards = args.dpo_beta * (student_chosen_logps - teacher_chosen_logps).detach()
+        rejected_rewards = args.dpo_beta * (student_reject_logps - teacher_reject_logps).detach()
         # return distil_loss, chosen_rewards, rejected_rewards
 
     return distil_loss
+'''
 
 
 def get_teacher_lm_loss(args, tokenizer, model, teacher_model, model_batch):
@@ -274,6 +337,14 @@ def get_teacher_lm_loss(args, tokenizer, model, teacher_model, model_batch):
 
     return lm_loss
 
+def get_run_time():
+    global start_time
+    cur_time = time.time()
+    duration = cur_time - start_time
+    hours = int(duration // 3600)
+    minutes = int((duration % 3600) // 60)
+    seconds = int(duration % 60)
+    return hours, minutes, seconds
 
 def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device, teacher_model=None):
     print_rank("Start Fine-tuning")
@@ -299,7 +370,10 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
     writer = SummaryWriter(f'{args.save}/tb_logs')
     
-    evaluate(args, tokenizer, model, dataset["dev"], "dev", 0, device)
+    global start_time
+    start_time = time.time()
+    # evaluate(args, tokenizer, model, dataset["dev"], "dev", 0, device)
+
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
 
@@ -330,12 +404,6 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             else:
                 loss = lm_loss
                 
-            if step % args.gradient_accumulation_steps == 0:
-                # tensorboard 
-                writer.add_scalar("loss", loss.detach(), global_step)
-                if teacher_model is not None:
-                    writer.add_scalar("distil_loss", distil_loss.detach(), global_step)
-            
             model.backward(loss)
             model.step()
             
@@ -347,6 +415,16 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 dist.all_reduce(distil_loss, dist.ReduceOp.SUM, group=dp_group)
                 global_distil_loss = distil_loss.item() / dp_world_size
                 total_distil_loss += global_distil_loss
+
+            if step % args.gradient_accumulation_steps == 0:
+                # tensorboard 
+                loss_dtch = (copy.copy(global_loss))
+                # loss_dtch = loss_dtch.to(torch.float32)
+                writer.add_scalar("loss", loss_dtch, global_step)
+                if teacher_model is not None:
+                    distill_loss_dtch = (copy.copy(global_distil_loss))
+                    # distill_loss_dtch = distill_loss_dtch.to(torch.float32)
+                    writer.add_scalar("distil_loss", distill_loss_dtch, global_step)
     
             torch.cuda.synchronize()
             elapsed_time = time.time() - st_time
@@ -529,6 +607,9 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
             res = {}
     
         avg_loss = all_loss / step
+
+        run_h, run_m, run_s = get_run_time()
+        res['run_time'] = f'{run_h}:{run_m}:{run_s}'
         
         log_str = f"{split} | avg_loss: {avg_loss} | {res}"
         print_rank(log_str)
@@ -539,9 +620,19 @@ def main():
     torch.backends.cudnn.enabled = False
     
     args = get_args()
+    random.seed(args.seed)  
+    np.random.seed(args.seed)  
+    torch.manual_seed(args.seed)  
+    if torch.cuda.is_available():  
+        torch.cuda.manual_seed(args.seed)  
+        torch.cuda.manual_seed_all(args.seed)  # for multi-GPU.  
+        
     initialize(args)
 
-    
+    # random seeds  
+    # torch.backends.cudnn.deterministic = True  
+    # torch.backends.cudnn.benchmark = False  
+  
     if dist.get_rank() == 0:
         print_args(args)
         # with open(os.path.join(args.save, "args.json"), "w") as f:
@@ -565,7 +656,7 @@ def main():
     if not args.do_train:
         ds_config["zero_optimization"]["stage"] = 0
     
-    args.fp32 = not ds_config["fp16"]["enabled"]    
+    # args.fp32 = not ds_config["fp16"]["enabled"]    
     args.deepspeed_config = None
     
     # get the tokenizer

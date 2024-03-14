@@ -169,7 +169,7 @@ def get_model(args, device):
         if args.model_type=="qwen":
             dtype = torch.float32 if args.fp32 else torch.float16
         else:
-            if args.fp32 and args.bf16:
+            if (args.fp32) and (args.bf16):
                 raise(f'data type error: both fp16 and bf16 !')
             # dtype = torch.float32 if args.fp32 else torch.bfloat16
             dtype = args.dtype if args.dtype is not None else torch.float32

@@ -17,7 +17,7 @@ import argparse
 import os
 import deepspeed
 import numpy as np
-
+import time
 
 def add_model_args(parser: argparse.ArgumentParser):
     """Model arguments"""
@@ -37,18 +37,24 @@ def add_model_args(parser: argparse.ArgumentParser):
     group.add_argument("--no-value", action="store_true")
     group.add_argument("--dropout-path-rate", type=float, default=None)
 
+    ### seqKD-DPO
     group.add_argument("--fp32", action="store_true")
     group.add_argument("--fp16", action="store_true")
     group.add_argument("--bf16", action="store_true")
     group.add_argument("--dtype", default=None)
+
+    ### TO finetune
     group.add_argument("--seqKD-DPO", action="store_true")
+    group.add_argument("--ipo", action="store_true")
+    group.add_argument("--DPOP", action="store_true")
 
     ### TO finetune
     group.add_argument("--reference-free", action="store_true")
-    group.add_argument("--dpo-beta", type=float, default=0.1)
     group.add_argument("--label-smoothing", type=float, default=0.)
+    group.add_argument("--dpo-beta", type=float, default=0.1)
     group.add_argument("--kd-ratio", type=float, default=None) # gpt2 seqkd: 0.5
     # place of the view(-1) 
+    group.add_argument("--DPOP-lambda", type=float, default=50)
     ###
     return parser
 
@@ -123,7 +129,7 @@ def add_hp_args(parser: argparse.ArgumentParser):
                        help='total number of iterations per epoch')
     group.add_argument('--max-length', type=int, default=1024,
                        help='max length of input')
-    group.add_argument('--seed', type=int, default=1234,
+    group.add_argument('--seed', type=int, default=42,
                        help='random seed for reproducibility')
     group.add_argument("--seed-order", type=int, default=42)
     group.add_argument("--seed-data", type=int, default=42)
@@ -301,5 +307,16 @@ def get_args():
         
         if args.warmup_iters > 0:
             assert args.scheduler_name is not None
+
+    time_exp = time.strftime("%Y_%m_%d-%H_%M", time.localtime())
+
+    args.save = args.save + (f'-IPO' if args.ipo else '') + \
+                (f'-DPOP_lambda_{args.DPOP_lambda}' if args.DPOP else '') + \
+                (f'-ref_free' if args.reference_free else '') + \
+                (f'-label_smth_{args.label_smoothing}') + \
+                (f'-dpo_beta_{args.dpo_beta}') + \
+                (f'-kd_ratio_{args.kd_ratio}') 
+
+    args.save = f'{args.save}/{time_exp}'
 
     return args

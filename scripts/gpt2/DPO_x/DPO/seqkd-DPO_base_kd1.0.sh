@@ -20,18 +20,15 @@ CKPT="gpt2" # download automatically
 TEACHER_CKPT_NAME="xlarge-sft"
 TEACHER_CKPT="${BASE_PATH}/ckpt/gpt2/train/sft/gpt2-xlarge/"
 # data
-# DATA_DIR="${BASE_PATH}/processed_data/dolly/pseudo/gpt2-xlarge-sft/"
 DATA_DIR="/home/v-yixingli/data/minillm/processed_data/dolly/pseudo/gpt2-xlarge-sft/"
-
 # hp
-BATCH_SIZE=2
+BATCH_SIZE=8
 LR=0.0005
 GRAD_ACC=1
 EVAL_BATCH_SIZE=8
 # length
 MAX_LENGTH=512
 # runtime
-SAVE_PATH="${BASE_PATH}/results/gpt2/train/seqkd"
 # seed
 SEED=10
 
@@ -60,7 +57,6 @@ OPTS+=" --lr-decay-style cosine"
 OPTS+=" --weight-decay 1e-2"
 OPTS+=" --clip-grad 1.0"
 OPTS+=" --epochs 20"
-OPTS+=" --kd-ratio 0.5"
 # length
 OPTS+=" --max-length ${MAX_LENGTH}"
 OPTS+=" --max-prompt-length 256"
@@ -72,7 +68,6 @@ OPTS+=" --save-interval -1"
 OPTS+=" --eval-interval -1"
 OPTS+=" --log-interval 4"
 OPTS+=" --mid-log-num -1"
-OPTS+=" --save ${SAVE_PATH}"
 # seed
 OPTS+=" --seed ${SEED}"
 # deepspeed
@@ -85,6 +80,16 @@ OPTS+=" --do-sample"
 OPTS+=" --top-k 0"
 OPTS+=" --top-p 1.0"
 OPTS+=" --temperature 1.0"
+
+
+
+### seqKD-DPO
+OPTS+=" --seqKD-DPO"
+OPTS+=" --bf16"
+OPTS+=" --kd-ratio 1.0"
+
+SAVE_PATH="${BASE_PATH}/results/gpt2/train/seqkd-DPO"
+OPTS+=" --save ${SAVE_PATH}"
 
 
 export NCCL_DEBUG=""
