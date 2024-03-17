@@ -552,11 +552,13 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                     if ckpt_path is not None and os.path.exists(ckpt_path):
                         shutil.rmtree(ckpt_path)
                 if eval_result['avg_loss'] >= np.max(eval_results['avg_loss']):
+                    print(f'at epoch {epoch}, save ckpt for avg_loss')
                     ckpt_name = f'avg_loss_{str(epoch)}'
                     save_ckpt(args, ckpt_name, model, tokenizer)
                     last_ckpt_path['avg_loss'] = os.path.join(args.save, ckpt_name)
                     
                 if eval_result['rougeL'] >= np.max(eval_results['rougeL']):
+                    print(f'at epoch {epoch}, save ckpt for rougeL')
                     ckpt_name = f'rougeL_{str(epoch)}'
                     save_ckpt(args, ckpt_name, model, tokenizer)
                     last_ckpt_path['rougeL'] = os.path.join(args.save, ckpt_name)
