@@ -4,7 +4,7 @@ MASTER_ADDR=localhost
 MASTER_PORT=${1-2012}
 NNODES=1
 NODE_RANK=0
-GPUS_PER_NODE=${3-1}
+GPUS_PER_NODE=1 #${3-1}
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --nnodes $NNODES \
@@ -13,7 +13,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --master_port $MASTER_PORT"
 
 # model
-BASE_PATH=${2-"/home/v-yixingli/code/LMOps/minillm"}
+BASE_PATH=/home/v-yixingli/code/LMOps/minillm #${2-"/home/v-yixingli/code/LMOps/minillm"}
 CKPT_NAME="gpt2-base"
 # CKPT="${BASE_PATH}/checkpoints/${CKPT_NAME}/"
 CKPT="gpt2" # download automatically
@@ -80,7 +80,7 @@ OPTS+=" --temperature 1.0"
 
 
 ### seqKD-DPO
-OPTS+=" --epochs 50"
+OPTS+=" --epochs 30"
 OPTS+=" --seqKD-DPO"
 OPTS+=" --bf16"
 OPTS+=" --kd-ratio 0.5"
@@ -89,8 +89,12 @@ SAVE_PATH="${BASE_PATH}/results/gpt2/train/seqkd-DPO-fr_sch"
 OPTS+=" --save ${SAVE_PATH}"
 
 # seed
-SEED=20
-OPTS+=" --seed ${SEED}"
+# SEED=30
+# OPTS+=" --seed ${SEED}"
+
+# db
+OPTS+=" --db-tmax"
+
 
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True

@@ -20,6 +20,7 @@ from tqdm import tqdm
 import math
 import copy
 import time
+import shutil
 
 from transformers import (
     AutoModelForCausalLM,
@@ -40,6 +41,9 @@ from utils import save_rank
 from utils import all_gather
 from utils import load_parallel, save_parallel
 from utils import get_tokenizer, get_model, parallel_model_map
+
+# yixing
+from utils import plot_simple_line_chart
 
 from accelerate import init_empty_weights
 
@@ -118,9 +122,14 @@ def get_learning_rate_scheduler(args, optimizer):
             optimizer,
             num_warmup_steps=args.warmup_iters)
     elif args.lr_decay_style == "cosine":
+        # goes here.
+        if args.db_tmax:
+            T_max_used = args.train_iters_per_epoch*20
+        else:
+            T_max_used = args.total_iters
         lr_scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=args.total_iters,
+            T_max=T_max_used, #args.total_iters, #args.train_iters_per_epoch*20, # yixing
             eta_min=args.lr_min)
     elif args.lr_decay_style == "noam":
         lr_scheduler = get_polynomial_decay_schedule_with_warmup(
@@ -213,12 +222,13 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
         student_reject_logps = torch.gather(log_student_probs, 2,y_s.unsqueeze(-1)).squeeze(-1)
 
         # teacher_chosen_logps [BATCH_SIZE, token_lenth] 
-        # mask = (no_model_batch["label"] != -100).int() # [bs, maxlenth]
+        mask = (no_model_batch["label"] != -100).int() # [bs, maxlenth]
 
         stu_logratios = student_chosen_logps - student_reject_logps # [bs, maxlenth]； in DPO, should shaped [bs]
         tea_logratios = teacher_chosen_logps - teacher_reject_logps
-        # stu_logratios = torch.sum(torch.mul(stu_logratios, mask), dim=-1) / torch.sum(mask, dim=-1)
-        # tea_logratios = torch.sum(torch.mul(tea_logratios, mask), dim=-1) / torch.sum(mask, dim=-1)
+        if args.trail2_sum_first_to_bs:
+            stu_logratios = torch.sum(torch.mul(stu_logratios, mask), dim=-1) / torch.sum(mask, dim=-1) # [bs]
+            tea_logratios = torch.sum(torch.mul(tea_logratios, mask), dim=-1) / torch.sum(mask, dim=-1)
 
         if args.reference_free:
             tea_logratios = 0
@@ -236,7 +246,16 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
             # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
             distil_loss = -F.logsigmoid(args.dpo_beta * relative_logits) * (1 - args.label_smoothing) - F.logsigmoid(-args.dpo_beta * relative_logits) * args.label_smoothing # [bs, max-lenth]
 
-        distil_loss = torch.sum(distil_loss) # num
+        if args.trail1_loss_not_add:
+            return distil_loss
+
+        if args.trail2_sum_first_to_bs:
+            distil_loss = torch.sum(distil_loss) # num
+        else:
+            if args.trail3_final_not_mask:
+                distil_loss = torch.sum(distil_loss) # num, loss -> 1.7k
+            else:
+                distil_loss = torch.sum(distil_loss.view(-1) * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0) # num, this: dpo loss -> 1.7
 
         chosen_rewards = args.dpo_beta * (student_chosen_logps - teacher_chosen_logps).detach()
         rejected_rewards = args.dpo_beta * (student_reject_logps - teacher_reject_logps).detach()
@@ -346,6 +365,32 @@ def get_run_time():
     seconds = int(duration % 60)
     return hours, minutes, seconds
 
+def get_eval_str(eval_results):
+    strs = []
+    for k, vs in eval_results.items():
+        bst_epoch, bst_result = np.argmax(vs), np.max(vs)
+        str_ = f'{k}_{bst_result}@{bst_epoch}'
+        strs.append(str_)
+    results_str = '-'.join(strs)
+    return results_str
+
+def save_ckpt(args, ckpt_name, model, tokenizer):
+    save_dir_path = os.path.join(args.save, ckpt_name)
+    if args.model_parallel:
+        if dist.get_rank() == 0:
+            os.makedirs(save_dir_path, exist_ok=True)
+            model.module.config.to_json_file(os.path.join(save_dir_path, "config.json"))
+            tokenizer.save_pretrained(save_dir_path)
+        if mpu.get_data_parallel_rank() == 0:
+            save_parallel(model.module, save_dir_path)
+    else:
+        if dist.get_rank() == 0:
+            os.makedirs(save_dir_path, exist_ok=True)
+            print_rank(f"Model save to {save_dir_path}")
+            tokenizer.save_pretrained(save_dir_path)
+            model.module.save_pretrained(save_dir_path, safe_serialization=False)
+    dist.barrier()
+
 def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device, teacher_model=None):
     print_rank("Start Fine-tuning")
 
@@ -372,8 +417,23 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
     
     global start_time
     start_time = time.time()
+    eval_results = {'avg_loss': [], 'exact_match': [], 'rougeL': []}
+    last_ckpt_path = {'avg_loss': None, 'rougeL': None}
+    last_image_path = {'avg_loss': None, 'exact_match': None, 'rougeL': None}
     # evaluate(args, tokenizer, model, dataset["dev"], "dev", 0, device)
+    eval_result = evaluate(args, tokenizer, model, dataset["dev"], "dev", 0, device)
+    for k, v in eval_result.items():
+        eval_results[k].append(v)
 
+    eval_str = get_eval_str(eval_results)
+    for k, vs in eval_results.items():
+        last_impath = last_image_path[k]
+        if last_impath is not None and os.path.exists(last_impath):
+            os.remove(last_impath)
+        this_impath = plot_simple_line_chart(data=vs, xlabel="epoch", ylabel=k, 
+                        title="", save_folder=args.save, 
+                        save_name=f"{k}-epoch", eval_str = eval_str)
+        last_image_path[k] = this_impath
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
 
@@ -467,27 +527,54 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
             
             # Checkpointing
-            if args.save and args.save_interval and global_step % args.save_interval == 0 and step % args.gradient_accumulation_steps == 0:
-                save_dir_path = os.path.join(args.save, str(global_step))
-                if args.model_parallel:
-                    if dist.get_rank() == 0:
-                        os.makedirs(save_dir_path, exist_ok=True)
-                        model.module.config.to_json_file(os.path.join(save_dir_path, "config.json"))
-                        tokenizer.save_pretrained(save_dir_path)
-                    if mpu.get_data_parallel_rank() == 0:
-                        save_parallel(model.module, save_dir_path)
-                else:
-                    if dist.get_rank() == 0:
-                        os.makedirs(save_dir_path, exist_ok=True)
-                        print_rank(f"Model save to {save_dir_path}")
-                        tokenizer.save_pretrained(save_dir_path)
-                        model.module.save_pretrained(save_dir_path, safe_serialization=False)
-                dist.barrier()
+            # if args.save and args.save_interval and global_step % args.save_interval == 0 and step % args.gradient_accumulation_steps == 0:
+            #     save_dir_path = os.path.join(args.save, str(global_step))
+            #     if args.model_parallel:
+            #         if dist.get_rank() == 0:
+            #             os.makedirs(save_dir_path, exist_ok=True)
+            #             model.module.config.to_json_file(os.path.join(save_dir_path, "config.json"))
+            #             tokenizer.save_pretrained(save_dir_path)
+            #         if mpu.get_data_parallel_rank() == 0:
+            #             save_parallel(model.module, save_dir_path)
+            #     else:
+            #         if dist.get_rank() == 0:
+            #             os.makedirs(save_dir_path, exist_ok=True)
+            #             print_rank(f"Model save to {save_dir_path}")
+            #             tokenizer.save_pretrained(save_dir_path)
+            #             model.module.save_pretrained(save_dir_path, safe_serialization=False)
+            #     dist.barrier()
 
             # Evaluation
-            if args.eval_interval and global_step % args.eval_interval == 0 and step % args.gradient_accumulation_steps == 0:
-                evaluate(args, tokenizer, model, dataset["dev"], "dev", epoch, device)
+            if args.eval_interval: 
+                eval_result = evaluate(args, tokenizer, model, dataset["dev"], "dev", epoch, device)
+
+                for ckpt_key, ckpt_path in last_ckpt_path.items():
+                    if ckpt_path is not None and os.path.exists(ckpt_path):
+                        shutil.rmtree(ckpt_path)
+                if eval_result['avg_loss'] > np.max(eval_results['avg_loss']):
+                    ckpt_name = f'avg_loss_{str(epoch)}'
+                    save_ckpt(args, ckpt_name, model, tokenizer)
+                    last_ckpt_path['avg_loss'] = os.path.join(args.save, ckpt_name)
                     
+                if eval_result['rougeL'] > np.max(eval_results['rougeL']):
+                    ckpt_name = f'rougeL_{str(epoch)}'
+                    save_ckpt(args, ckpt_name, model, tokenizer)
+                    last_ckpt_path['rougeL'] = os.path.join(args.save, ckpt_name)
+
+                ##
+                for k, v in eval_result.items():
+                    eval_results[k].append(v)
+
+                eval_str = get_eval_str(eval_results)
+                for k, vs in eval_results.items():
+                    last_impath = last_image_path[k]
+                    if last_impath is not None and os.path.exists(last_impath):
+                        os.remove(last_impath)
+                    this_impath = plot_simple_line_chart(data=vs, xlabel="epoch", ylabel=k, 
+                                    title="", save_folder=args.save, 
+                                    save_name=f"{k}-epoch", eval_str = eval_str)
+                    last_image_path[k] = this_impath
+                ##
                 model.train()
                 
             step += 1
@@ -615,6 +702,8 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
         print_rank(log_str)
         save_rank(log_str, os.path.join(args.save, "log.txt"))
 
+        return {'avg_loss': avg_loss, 'exact_match': res['exact_match'], 'rougeL': res['rougeL']}
+
 
 def main():
     torch.backends.cudnn.enabled = False
@@ -626,12 +715,11 @@ def main():
     if torch.cuda.is_available():  
         torch.cuda.manual_seed(args.seed)  
         torch.cuda.manual_seed_all(args.seed)  # for multi-GPU.  
+    torch.backends.cudnn.deterministic = True  
+    torch.backends.cudnn.benchmark = False  
         
     initialize(args)
 
-    # random seeds  
-    # torch.backends.cudnn.deterministic = True  
-    # torch.backends.cudnn.benchmark = False  
   
     if dist.get_rank() == 0:
         print_args(args)

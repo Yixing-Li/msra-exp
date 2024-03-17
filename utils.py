@@ -1,4 +1,5 @@
 from typing import Dict
+import matplotlib.pyplot as plt
 import numpy as np
 import os
 import time
@@ -258,3 +259,25 @@ def save_parallel(model, save_dir):
     checkpoint_name = os.path.join(save_dir, f"mp{mpu.get_model_parallel_world_size()}", f"pytorch_model_{mp_rank}.bin")
     torch.save(model.state_dict(), checkpoint_name)
     print(f"Rank {get_rank()}: {checkpoint_name} saved.")
+
+def plot_simple_line_chart(data: list, 
+                           xlabel: str, 
+                           ylabel: str, 
+                           title: str, 
+                           save_folder: str, 
+                           save_name: str, 
+                           eval_str: str,
+                           X=None):
+    os.makedirs(save_folder, exist_ok=True)
+    plt.figure(figsize=(8, 6))
+    plt.title(title)
+    if X is None: X = np.arange(len(data))
+    plt.plot(X, data)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.text(3, 5, eval_str, fontsize=12, color='black')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_folder, f"{save_name}_{eval_str}.png"), dpi=200)
+    plt.close("all")
+
+    return os.path.join(save_folder, f"{save_name}_{eval_str}.png")

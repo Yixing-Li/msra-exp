@@ -55,7 +55,14 @@ def add_model_args(parser: argparse.ArgumentParser):
     group.add_argument("--kd-ratio", type=float, default=None) # gpt2 seqkd: 0.5
     # place of the view(-1) 
     group.add_argument("--DPOP-lambda", type=float, default=50)
-    ###
+
+    ### debug
+    group.add_argument("--trail1-loss-not-add", action="store_true")
+    group.add_argument("--trail2-sum-first-to-bs", action="store_true")
+    group.add_argument("--trail3-final-not-mask", action="store_true")
+    group.add_argument("--db-tmax", action="store_true")
+
+    
     return parser
 
 
@@ -315,7 +322,8 @@ def get_args():
                 (f'-ref_free' if args.reference_free else '') + \
                 (f'-label_smth_{args.label_smoothing}') + \
                 (f'-dpo_beta_{args.dpo_beta}') + \
-                (f'-kd_ratio_{args.kd_ratio}') 
+                (f'-kd_ratio_{args.kd_ratio}') + \
+                (f'-seed_{args.seed}') 
 
     args.save = f'{args.save}/{time_exp}'
 

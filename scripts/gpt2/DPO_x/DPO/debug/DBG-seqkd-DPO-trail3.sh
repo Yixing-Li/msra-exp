@@ -85,12 +85,15 @@ OPTS+=" --seqKD-DPO"
 OPTS+=" --bf16"
 OPTS+=" --kd-ratio 0.5"
 
-SAVE_PATH="${BASE_PATH}/results/gpt2/train/seqkd-DPO-fr_sch"
+SAVE_PATH="${BASE_PATH}/results/gpt2/train/seqkd-DPO-fr_sch/DEBUG/trail3"
 OPTS+=" --save ${SAVE_PATH}"
 
+### DEBUG
+OPTS+=" --trail3-final-not-mask"
 # seed
-SEED=20
+SEED=10
 OPTS+=" --seed ${SEED}"
+
 
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True

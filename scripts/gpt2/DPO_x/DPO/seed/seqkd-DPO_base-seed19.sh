@@ -89,8 +89,12 @@ SAVE_PATH="${BASE_PATH}/results/gpt2/train/seqkd-DPO-fr_sch"
 OPTS+=" --save ${SAVE_PATH}"
 
 # seed
-SEED=20
+SEED=19
 OPTS+=" --seed ${SEED}"
+
+# db
+OPTS+=" --db-tmax"
+
 
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True

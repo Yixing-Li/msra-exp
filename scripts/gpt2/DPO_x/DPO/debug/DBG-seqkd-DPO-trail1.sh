@@ -30,6 +30,8 @@ EVAL_BATCH_SIZE=8
 # length
 MAX_LENGTH=512
 # runtime
+# seed
+SEED=10
 
 
 OPTS=""
@@ -66,6 +68,8 @@ OPTS+=" --save-interval -1"
 OPTS+=" --eval-interval -1"
 OPTS+=" --log-interval 4"
 OPTS+=" --mid-log-num -1"
+# seed
+OPTS+=" --seed ${SEED}"
 # deepspeed
 OPTS+=" --deepspeed"
 OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config.json"
@@ -85,12 +89,13 @@ OPTS+=" --seqKD-DPO"
 OPTS+=" --bf16"
 OPTS+=" --kd-ratio 0.5"
 
-SAVE_PATH="${BASE_PATH}/results/gpt2/train/seqkd-DPO-fr_sch"
+SAVE_PATH="${BASE_PATH}/results/gpt2/train/seqkd-DPO-fr_sch/DEBUG/trail1"
 OPTS+=" --save ${SAVE_PATH}"
 
-# seed
-SEED=20
-OPTS+=" --seed ${SEED}"
+### DEBUG
+OPTS+=" --trail1-loss-not-add"
+
+
 
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True
