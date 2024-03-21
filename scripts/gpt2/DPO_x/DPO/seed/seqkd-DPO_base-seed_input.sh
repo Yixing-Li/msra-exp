@@ -13,13 +13,14 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --master_port $MASTER_PORT"
 
 # model
-BASE_PATH=/home/v-yixingli/code/LMOps/minillm #${2-"/home/v-yixingli/code/LMOps/minillm"}
+from_path=/home/v-yixingli/code/LMOps/minillm
+BASE_PATH=/home/v-yixingli/code/minillm #${2-"/home/v-yixingli/code/LMOps/minillm"}
 CKPT_NAME="gpt2-base"
 # CKPT="${BASE_PATH}/checkpoints/${CKPT_NAME}/"
 CKPT="gpt2" # download automatically
 # CKPT="${BASE_PATH}/results/gpt2/train/seqkd-DPO/e20-bs8-lr0.0005-G1-N1-NN1-kd0.5/2024_03_12-15_33/28580/"    
 TEACHER_CKPT_NAME="xlarge-sft"
-TEACHER_CKPT="${BASE_PATH}/ckpt/gpt2/train/sft/gpt2-xlarge/"
+TEACHER_CKPT="${from_path}/ckpt/gpt2/train/sft/gpt2-xlarge/"
 # data
 DATA_DIR="/home/v-yixingli/data/minillm/processed_data/dolly/pseudo/gpt2-xlarge-sft/"
 # hp

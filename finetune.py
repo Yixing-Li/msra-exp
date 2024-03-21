@@ -548,20 +548,30 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             if args.eval_interval and global_step % args.eval_interval == 0 and step % args.gradient_accumulation_steps == 0:
                 eval_result = evaluate(args, tokenizer, model, dataset["dev"], "dev", epoch, device)
 
-                for ckpt_key, ckpt_path in last_ckpt_path.items():
-                    if ckpt_path is not None and os.path.exists(ckpt_path):
-                        shutil.rmtree(ckpt_path)
-                if eval_result['avg_loss'] >= np.max(eval_results['avg_loss']):
-                    print(f'at epoch {epoch}, save ckpt for avg_loss')
-                    ckpt_name = f'avg_loss_{str(epoch)}'
-                    save_ckpt(args, ckpt_name, model, tokenizer)
-                    last_ckpt_path['avg_loss'] = os.path.join(args.save, ckpt_name)
-                    
+                # for ckpt_key, ckpt_path in last_ckpt_path.items():
+                #     if ckpt_path is not None and os.path.exists(ckpt_path):
+                #         shutil.rmtree(ckpt_path)
                 if eval_result['rougeL'] >= np.max(eval_results['rougeL']):
                     print(f'at epoch {epoch}, save ckpt for rougeL')
-                    ckpt_name = f'rougeL_{str(epoch)}'
+                    last_to_delete = last_ckpt_path['rougeL']
+                    if last_to_delete is not None and os.path.exists(last_to_delete):
+                        shutil.rmtree(last_to_delete)
+                        while(os.path.exists(last_to_delete)):
+                            time.sleep(0.5)
+                    ckpt_name = f'rougeL_{str(epoch+1)}'
                     save_ckpt(args, ckpt_name, model, tokenizer)
                     last_ckpt_path['rougeL'] = os.path.join(args.save, ckpt_name)
+
+                if eval_result['avg_loss'] >= np.max(eval_results['avg_loss']):
+                    print(f'at epoch {epoch}, save ckpt for avg_loss')
+                    last_to_delete = last_ckpt_path['avg_loss']
+                    if last_to_delete is not None and os.path.exists(last_to_delete):
+                        shutil.rmtree(last_to_delete)
+                        while(os.path.exists(last_to_delete)):
+                            time.sleep(0.5)
+                    ckpt_name = f'avg_loss_{str(epoch+1)}'
+                    save_ckpt(args, ckpt_name, model, tokenizer)
+                    last_ckpt_path['avg_loss'] = os.path.join(args.save, ckpt_name)
 
                 ##
                 for k, v in eval_result.items():
